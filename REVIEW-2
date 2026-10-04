@@ -1,0 +1,1095 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+
+#include <sys/utsname.h>
+#include <sys/statvfs.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+
+#include <fcntl.h>
+
+#define REFRESH_TIME 2
+#define FIFO_PATH "/tmp/sysmon_fifo"
+
+static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t signal_count = 0;
+
+
+/* ============================================================
+   CO-1 : THE OS AS A SERVICE LAYER
+   ============================================================
+   Topics covered:
+   - OS as a service layer
+   - User space and kernel space
+   - System calls
+   - Kernel services
+   - Shell as a user-space program
+   - Command execution
+   - Linux architecture
+   - Systems programming
+   - CPU, memory, disk and process information
+   ============================================================ */
+
+
+/* CO-1 : Signal handling for safe program termination */
+
+void sigint_handler(int signal_number)
+{
+    (void)signal_number;
+    running = 0;
+}
+
+
+/* CO-1 : Reading CPU information from Linux /proc filesystem */
+
+unsigned long long read_cpu(unsigned long long *idle_time)
+{
+    FILE *file;
+
+    unsigned long long user = 0;
+    unsigned long long nice = 0;
+    unsigned long long system = 0;
+    unsigned long long idle = 0;
+    unsigned long long iowait = 0;
+    unsigned long long irq = 0;
+    unsigned long long softirq = 0;
+    unsigned long long steal = 0;
+
+    file = fopen("/proc/stat", "r");
+
+    if (file == NULL)
+    {
+        return 0;
+    }
+
+    fscanf(file,
+           "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+           &user,
+           &nice,
+           &system,
+           &idle,
+           &iowait,
+           &irq,
+           &softirq,
+           &steal);
+
+    fclose(file);
+
+    *idle_time = idle + iowait;
+
+    return user + nice + system + idle +
+           iowait + irq + softirq + steal;
+}
+
+
+/* CO-1 : Reading memory information from Linux /proc filesystem */
+
+void read_memory(unsigned long long *total,
+                 unsigned long long *available)
+{
+    FILE *file;
+
+    char key[64];
+    char unit[32];
+
+    unsigned long long value;
+
+    *total = 0;
+    *available = 0;
+
+    file = fopen("/proc/meminfo", "r");
+
+    if (file == NULL)
+    {
+        return;
+    }
+
+    while (fscanf(file,
+                   "%63s %llu %31s",
+                   key,
+                   &value,
+                   unit) == 3)
+    {
+        if (strcmp(key, "MemTotal:") == 0)
+        {
+            *total = value;
+        }
+
+        if (strcmp(key, "MemAvailable:") == 0)
+        {
+            *available = value;
+        }
+    }
+
+    fclose(file);
+}
+
+
+/* CO-1 : Display Linux system information */
+
+void display_system_information(double cpu_usage)
+{
+    struct utsname system_info;
+
+    char hostname[256];
+
+    FILE *uptime_file;
+
+    double uptime_seconds = 0;
+
+    unsigned long long memory_total;
+    unsigned long long memory_available;
+
+    struct statvfs disk;
+
+
+    /* Clear terminal */
+
+    printf("\033[2J");
+    printf("\033[H");
+
+
+    printf("====================================================================\n");
+    printf("             LINUX SYSTEM INFORMATION MONITOR\n");
+    printf("====================================================================\n");
+
+
+    /* ------------------------------------------------------------
+       CO-1 : Linux system information
+       ------------------------------------------------------------ */
+
+    printf("\n[ CO-1 : OS AS A SERVICE LAYER ]\n");
+
+    printf("\nSYSTEM INFORMATION\n");
+
+
+    /*
+       CO-1 : uname()
+
+       This is a system interface used to obtain
+       information supplied by the Linux kernel.
+    */
+
+    if (uname(&system_info) == 0)
+    {
+        /*
+           CO-1 : gethostname()
+        */
+
+        gethostname(hostname,
+                    sizeof(hostname) - 1);
+
+        hostname[sizeof(hostname) - 1] = '\0';
+
+
+        printf("Operating System : %s\n",
+               system_info.sysname);
+
+        printf("Kernel Version   : %s\n",
+               system_info.release);
+
+        printf("Architecture     : %s\n",
+               system_info.machine);
+
+        printf("Hostname         : %s\n",
+               hostname);
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-1 : Linux uptime
+       ------------------------------------------------------------ */
+
+    uptime_file = fopen("/proc/uptime", "r");
+
+    if (uptime_file != NULL)
+    {
+        if (fscanf(uptime_file,
+                   "%lf",
+                   &uptime_seconds) == 1)
+        {
+            printf("System Uptime    : %.2f hours\n",
+                   uptime_seconds / 3600.0);
+        }
+
+        fclose(uptime_file);
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-1 : CPU and memory resources
+       ------------------------------------------------------------ */
+
+    printf("\nRESOURCE UTILIZATION\n");
+
+
+    if (cpu_usage < 0)
+    {
+        printf("CPU Usage        : Collecting data...\n");
+    }
+    else
+    {
+        printf("CPU Usage        : %.2f %%\n",
+               cpu_usage);
+    }
+
+
+    read_memory(&memory_total,
+                &memory_available);
+
+
+    if (memory_total > 0)
+    {
+        double memory_used;
+
+        memory_used =
+            ((double)(memory_total - memory_available)
+             / memory_total) * 100.0;
+
+
+        printf("Memory Usage     : %.2f %%\n",
+               memory_used);
+
+        printf("Memory Used      : %.2f MB\n",
+               (memory_total - memory_available)
+               / 1024.0);
+
+        printf("Total Memory     : %.2f MB\n",
+               memory_total / 1024.0);
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-1 : Disk information
+       ------------------------------------------------------------ */
+
+    if (statvfs("/", &disk) == 0)
+    {
+        unsigned long long total_space;
+        unsigned long long used_space;
+
+
+        total_space =
+            (unsigned long long)disk.f_blocks *
+            disk.f_frsize;
+
+
+        used_space =
+            (unsigned long long)
+            (disk.f_blocks - disk.f_bfree) *
+            disk.f_frsize;
+
+
+        if (total_space > 0)
+        {
+            printf("Root Disk Usage  : %.2f %%\n",
+                   100.0 *
+                   (double)used_space /
+                   total_space);
+        }
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-1 : Process information
+       ------------------------------------------------------------ */
+
+    printf("\nPROCESS CONTEXT\n");
+
+
+    /*
+       CO-1 : System calls
+    */
+
+    printf("Current PID      : %ld\n",
+           (long)getpid());
+
+    printf("Parent PID       : %ld\n",
+           (long)getppid());
+
+    printf("Process Group ID : %ld\n",
+           (long)getpgrp());
+
+    printf("Session ID       : %ld\n",
+           (long)getsid(0));
+
+    printf("Process Priority : %d\n",
+           getpriority(PRIO_PROCESS, 0));
+
+
+    /* ------------------------------------------------------------
+       CO-1 : Shell and command execution
+       ------------------------------------------------------------ */
+
+    printf("\nRUNNING PROCESSES\n");
+
+    printf("-----------------------------------------------\n");
+
+    printf("PID      PPID     STATE     COMMAND\n");
+
+    printf("-----------------------------------------------\n");
+
+
+    /*
+       CO-1 : popen()
+
+       popen() starts a shell command.
+
+       Shell executes:
+       ps -eo pid,ppid,state,comm --sort=-%cpu
+
+       This demonstrates the role of the shell as
+       a user-space program.
+    */
+
+    FILE *process_file;
+
+
+    process_file =
+        popen("ps -eo pid,ppid,state,comm --sort=-%cpu | head -n 8",
+              "r");
+
+
+    if (process_file != NULL)
+    {
+        char line[256];
+
+
+        while (fgets(line,
+                     sizeof(line),
+                     process_file) != NULL)
+        {
+            printf("%s", line);
+        }
+
+
+        pclose(process_file);
+    }
+
+
+    printf("\n");
+
+    printf("Auto Refresh     : Every %d seconds\n",
+           REFRESH_TIME);
+
+    printf("Press Ctrl+C to exit.\n");
+
+    printf("====================================================================\n");
+
+    fflush(stdout);
+}
+
+
+/* CO-1 : Main monitoring loop */
+
+void run_monitor()
+{
+    struct sigaction action;
+
+
+    memset(&action,
+           0,
+           sizeof(action));
+
+
+    action.sa_handler =
+        sigint_handler;
+
+
+    sigemptyset(&action.sa_mask);
+
+
+    sigaction(SIGINT,
+              &action,
+              NULL);
+
+
+    unsigned long long idle1;
+    unsigned long long idle2;
+
+    unsigned long long total1;
+    unsigned long long total2;
+
+
+    total1 =
+        read_cpu(&idle1);
+
+
+    while (running)
+    {
+        struct timespec sleep_time;
+
+
+        sleep_time.tv_sec =
+            REFRESH_TIME;
+
+        sleep_time.tv_nsec = 0;
+
+
+        while (nanosleep(&sleep_time,
+                         &sleep_time) == -1 &&
+               errno == EINTR &&
+               running)
+        {
+        }
+
+
+        if (!running)
+        {
+            break;
+        }
+
+
+        total2 =
+            read_cpu(&idle2);
+
+
+        double cpu_usage = -1;
+
+
+        if (total2 > total1)
+        {
+            unsigned long long total_difference;
+            unsigned long long idle_difference;
+
+
+            total_difference =
+                total2 - total1;
+
+
+            idle_difference =
+                idle2 - idle1;
+
+
+            cpu_usage =
+                100.0 *
+                ((double)total_difference -
+                 (double)idle_difference)
+                /
+                (double)total_difference;
+        }
+
+
+        display_system_information(cpu_usage);
+
+
+        total1 = total2;
+        idle1 = idle2;
+    }
+
+
+    printf("\nMonitoring stopped safely.\n");
+}
+
+
+/* ============================================================
+   CO-2 : PROCESSES AND PROCESS CONTROL
+   ============================================================
+   Topics covered:
+   - Process abstraction
+   - Process creation
+   - Process lifecycle
+   - fork()
+   - exec()
+   - Synchronization
+   - waitpid()
+   - Process termination
+   ============================================================ */
+
+
+/* CO-2 : Process creation, execution and synchronization */
+
+void process_demo()
+{
+    pid_t child_pid;
+
+    int status;
+
+
+    printf("\n");
+    printf("============================================================\n");
+    printf("             CO-2 : PROCESS CONTROL\n");
+    printf("============================================================\n");
+
+
+    printf("\nParent Process\n");
+
+    printf("Parent PID : %ld\n",
+           (long)getpid());
+
+
+    /* ------------------------------------------------------------
+       CO-2 : Process creation using fork()
+       ------------------------------------------------------------ */
+
+    printf("\nCreating child process using fork()...\n");
+
+
+    child_pid =
+        fork();
+
+
+    if (child_pid < 0)
+    {
+        perror("fork");
+
+        return;
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-2 : Child process
+       ------------------------------------------------------------ */
+
+    if (child_pid == 0)
+    {
+        printf("\nCHILD PROCESS\n");
+
+        printf("Child PID  : %ld\n",
+               (long)getpid());
+
+        printf("Parent PID : %ld\n",
+               (long)getppid());
+
+
+        /* --------------------------------------------------------
+           CO-2 : Process execution using exec()
+           -------------------------------------------------------- */
+
+        printf("\nExecuting external program using exec()...\n");
+
+        printf("Command: uname -a\n\n");
+
+
+        execlp("uname",
+               "uname",
+               "-a",
+               (char *)NULL);
+
+
+        /*
+           Reached only if exec fails.
+        */
+
+        perror("execlp");
+
+        _exit(127);
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-2 : Parent process synchronization
+       ------------------------------------------------------------ */
+
+    printf("\nPARENT PROCESS\n");
+
+    printf("Child PID : %ld\n",
+           (long)child_pid);
+
+
+    printf("\nParent waiting for child using waitpid()...\n");
+
+
+    if (waitpid(child_pid,
+                &status,
+                0) < 0)
+    {
+        perror("waitpid");
+
+        return;
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-2 : Process termination
+       ------------------------------------------------------------ */
+
+    printf("\nPROCESS TERMINATION\n");
+
+
+    if (WIFEXITED(status))
+    {
+        printf("Child terminated normally.\n");
+
+        printf("Exit Status : %d\n",
+               WEXITSTATUS(status));
+    }
+    else
+    {
+        printf("Child did not terminate normally.\n");
+    }
+
+
+    printf("\n");
+    printf("CO-2 implementation includes:\n");
+
+    printf("fork()    -> Process creation\n");
+
+    printf("exec()    -> Process execution\n");
+
+    printf("waitpid() -> Process synchronization\n");
+
+    printf("exit      -> Process termination\n");
+
+
+    printf("============================================================\n");
+}
+
+
+/* ============================================================
+   CO-3 : INTER-PROCESS COMMUNICATION (IPC)
+   ============================================================
+   Topics covered:
+   - Anonymous Pipes
+   - Named Pipes / FIFOs
+   - Signals
+   - Signal handlers
+   - Asynchronous notifications
+   - Process Groups
+   - Sessions
+   - Job Control
+   ============================================================ */
+
+
+/* ------------------------------------------------------------
+   CO-3 : Anonymous Pipe
+   ------------------------------------------------------------ */
+
+void anonymous_pipe_demo()
+{
+    int pipe_fd[2];
+
+    pid_t child_pid;
+
+
+    printf("\n");
+    printf("------------------------------------------------------------\n");
+    printf("CO-3 : ANONYMOUS PIPE\n");
+    printf("------------------------------------------------------------\n");
+
+
+    /*
+       CO-3 : Create anonymous pipe
+
+       pipe_fd[0] = read end
+       pipe_fd[1] = write end
+    */
+
+    if (pipe(pipe_fd) == -1)
+    {
+        perror("pipe");
+
+        return;
+    }
+
+
+    child_pid =
+        fork();
+
+
+    if (child_pid < 0)
+    {
+        perror("fork");
+
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+
+        return;
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-3 : Child writes to pipe
+       ------------------------------------------------------------ */
+
+    if (child_pid == 0)
+    {
+        const char message[] =
+            "Hello from child through anonymous pipe!";
+
+
+        close(pipe_fd[0]);
+
+
+        write(pipe_fd[1],
+              message,
+              sizeof(message));
+
+
+        close(pipe_fd[1]);
+
+
+        _exit(0);
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-3 : Parent reads from pipe
+       ------------------------------------------------------------ */
+
+    else
+    {
+        char buffer[200];
+
+
+        memset(buffer,
+               0,
+               sizeof(buffer));
+
+
+        close(pipe_fd[1]);
+
+
+        read(pipe_fd[0],
+             buffer,
+             sizeof(buffer) - 1);
+
+
+        printf("Parent received:\n");
+
+        printf("%s\n",
+               buffer);
+
+
+        close(pipe_fd[0]);
+
+
+        waitpid(child_pid,
+                NULL,
+                0);
+    }
+
+
+    printf("\nAnonymous pipe communication completed.\n");
+}
+
+
+/* ------------------------------------------------------------
+   CO-3 : Named Pipe / FIFO
+   ------------------------------------------------------------ */
+
+void named_pipe_demo()
+{
+    pid_t child_pid;
+
+
+    printf("\n");
+    printf("------------------------------------------------------------\n");
+    printf("CO-3 : NAMED PIPE / FIFO\n");
+    printf("------------------------------------------------------------\n");
+
+
+    /*
+       CO-3 : Create named pipe
+    */
+
+    if (mkfifo(FIFO_PATH,
+               0600) == -1)
+    {
+        if (errno != EEXIST)
+        {
+            perror("mkfifo");
+
+            return;
+        }
+    }
+
+
+    child_pid =
+        fork();
+
+
+    if (child_pid < 0)
+    {
+        perror("fork");
+
+        unlink(FIFO_PATH);
+
+        return;
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-3 : Child writes to FIFO
+       ------------------------------------------------------------ */
+
+    if (child_pid == 0)
+    {
+        int fifo_fd;
+
+        const char message[] =
+            "Hello through named FIFO!";
+
+
+        fifo_fd =
+            open(FIFO_PATH,
+                 O_WRONLY);
+
+
+        if (fifo_fd == -1)
+        {
+            perror("FIFO open");
+
+            _exit(1);
+        }
+
+
+        write(fifo_fd,
+              message,
+              sizeof(message));
+
+
+        close(fifo_fd);
+
+        _exit(0);
+    }
+
+
+    /* ------------------------------------------------------------
+       CO-3 : Parent reads from FIFO
+       ------------------------------------------------------------ */
+
+    else
+    {
+        int fifo_fd;
+
+        char buffer[200];
+
+
+        memset(buffer,
+               0,
+               sizeof(buffer));
+
+
+        fifo_fd =
+            open(FIFO_PATH,
+                 O_RDONLY);
+
+
+        if (fifo_fd == -1)
+        {
+            perror("FIFO open");
+        }
+        else
+        {
+            read(fifo_fd,
+                 buffer,
+                 sizeof(buffer) - 1);
+
+
+            printf("Parent received:\n");
+
+            printf("%s\n",
+                   buffer);
+
+
+            close(fifo_fd);
+        }
+
+
+        waitpid(child_pid,
+                NULL,
+                0);
+
+
+        /*
+           CO-3 : Remove FIFO
+        */
+
+        unlink(FIFO_PATH);
+    }
+
+
+    printf("\nNamed FIFO communication completed.\n");
+}
+
+
+/* ------------------------------------------------------------
+   CO-3 : Signal Handler
+   ------------------------------------------------------------ */
+
+void usr1_handler(int signal_number)
+{
+    (void)signal_number;
+
+    signal_count++;
+}
+
+
+/* ------------------------------------------------------------
+   CO-3 : Signals and Asynchronous Notification
+   ------------------------------------------------------------ */
+
+void signal_demo()
+{
+    struct sigaction action;
+
+
+    printf("\n");
+    printf("------------------------------------------------------------\n");
+    printf("CO-3 : SIGNALS AND ASYNCHRONOUS NOTIFICATION\n");
+    printf("------------------------------------------------------------\n");
+
+
+    memset(&action,
+           0,
+           sizeof(action));
+
+
+    action.sa_handler =
+        usr1_handler;
+
+
+    sigemptyset(&action.sa_mask);
+
+
+    /*
+       CO-3 : Register signal handler
+    */
+
+    if (sigaction(SIGUSR1,
+                  &action,
+                  NULL) == -1)
+    {
+        perror("sigaction");
+
+        return;
+    }
+
+
+    signal_count = 0;
+
+
+    printf("Current PID : %ld\n",
+           (long)getpid());
+
+
+    printf("\nSending SIGUSR1...\n");
+
+
+    /*
+       CO-3 : Send signal
+    */
+
+    if (kill(getpid(),
+             SIGUSR1) == -1)
+    {
+        perror("kill");
+
+        return;
+    }
+
+
+    printf("Signal handler executed.\n");
+
+    printf("Signal count : %d\n",
+           (int)signal_count);
+
+
+    printf("\nAsynchronous signal notification completed.\n");
+}
+
+
+/* ------------------------------------------------------------
+   CO-3 : Process Groups and Sessions
+   ------------------------------------------------------------ */
+
+void process_group_demo()
+{
+    printf("\n");
+    printf("------------------------------------------------------------\n");
+    printf("CO-3 : PROCESS GROUPS AND SESSIONS\n");
+    printf("------------------------------------------------------------\n");
+
+
+    /*
+       CO-3 : Process group
+    */
+
+    printf("Process ID       : %ld\n",
+           (long)getpid());
+
+
+    /*
+       CO-3 : Parent process
+    */
+
+    printf("Parent Process ID: %ld\n",
+           (long)getppid());
+
+
+    /*
+       CO-3 : Process group ID
+    */
+
+    printf("Process Group ID : %ld\n",
+           (long)getpgrp());
+
+
+    /*
+       CO-3 : Session ID
+    */
+
+    printf("Session ID       : %ld\n",
+           (long)getsid(0));
+
+
+    printf("\nProcess groups and sessions are used by Linux\n");
+
+    printf("for process management and job control.\n");
+}
+
+
+/* ------------------------------------------------------------
+   CO-3 : Complete IPC demonstration
+   ------------------------------------------------------------ */
+
+void ipc_demo()
+{
+    printf("\n");
+    printf("============================================================\n");
+    printf("                    CO-3 : IPC\n");
+    printf("============================================================\n");
+
+
+    anonymous_pipe_demo();
+
+    named_pipe_demo();
+
+    signal_demo();
+
+    process_group_demo();
+
+
+    printf("\n============================================================\n");
+
+    printf("CO-3 implementation completed.\n");
+
+    printf("============================================================\n");
+}
+
+
+/* ============================================================
+   MAIN FUNCTION
+   ============================================================ */
+
+int main()
+{
+    /*
+       Main program starts the unified
+       Linux terminal monitoring interface.
+    */
+
+    run_monitor();
+
+    return 0;
+}
