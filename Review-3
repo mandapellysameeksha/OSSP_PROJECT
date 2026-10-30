@@ -1,0 +1,1407 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+/*
+ * LINUX SYSTEM INFORMATION AND RESOURCE MONITORING TOOL
+ * FINAL VERSION
+ *
+ * CO-1: OS as a Service Layer
+ * CO-2: Processes and Process Control
+ * CO-3: Inter-Process Communication (IPC)
+ * CO-4: Memory Management
+ * CO-5: File Systems, File Abstraction and File I/O
+ * CO-6: Concurrency and Synchronization
+ *
+ * Terminal-only Linux systems-programming project.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <time.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/statfs.h>
+#include <sys/utsname.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
+#include <sys/sysmacros.h>
+#include <sched.h>
+
+#define REFRESH_SECONDS 2
+#define FIFO_PATH "/tmp/sysmon_final_fifo"
+#define TEST_FILE "/tmp/sysmon_final_test.txt"
+
+#define THREAD_COUNT 4
+#define ITERATIONS 100000
+
+#ifndef EXT4_SUPER_MAGIC
+#define EXT4_SUPER_MAGIC 0xEF53
+#endif
+
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_signal_count = 0;
+
+/* ============================================================
+   GENERAL FUNCTIONS
+   ============================================================ */
+
+static void clear_screen(void)
+{
+    printf("\033[2J\033[H");
+}
+
+static void wait_for_enter(void)
+{
+    int c;
+
+    printf("\nPress Enter to return to the main monitor...");
+    fflush(stdout);
+
+    while ((c = getchar()) != '\n' && c != EOF)
+    {
+    }
+}
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    g_running = 0;
+}
+
+static void sigusr1_handler(int sig)
+{
+    (void)sig;
+    g_signal_count++;
+}
+
+/* ============================================================
+   CO-1: OS AS A SERVICE LAYER
+   ============================================================ */
+
+static int read_cpu(unsigned long long *total,
+                    unsigned long long *idle)
+{
+    FILE *f;
+
+    unsigned long long user = 0;
+    unsigned long long nicev = 0;
+    unsigned long long system = 0;
+    unsigned long long idlev = 0;
+    unsigned long long iowait = 0;
+    unsigned long long irq = 0;
+    unsigned long long softirq = 0;
+    unsigned long long steal = 0;
+
+    f = fopen("/proc/stat", "r");
+
+    if (f == NULL)
+        return -1;
+
+    if (fscanf(f,
+               "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+               &user,
+               &nicev,
+               &system,
+               &idlev,
+               &iowait,
+               &irq,
+               &softirq,
+               &steal) != 8)
+    {
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+
+    *idle = idlev + iowait;
+
+    *total =
+        user +
+        nicev +
+        system +
+        idlev +
+        iowait +
+        irq +
+        softirq +
+        steal;
+
+    return 0;
+}
+
+static double cpu_usage_once(unsigned int delay_seconds)
+{
+    unsigned long long t1;
+    unsigned long long t2;
+
+    unsigned long long i1;
+    unsigned long long i2;
+
+    struct timespec ts;
+
+    if (read_cpu(&t1, &i1) != 0)
+        return -1.0;
+
+    ts.tv_sec = (time_t)delay_seconds;
+    ts.tv_nsec = 0;
+
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
+    {
+    }
+
+    if (read_cpu(&t2, &i2) != 0)
+        return -1.0;
+
+    if (t2 <= t1)
+        return -1.0;
+
+    return 100.0 *
+           ((double)(t2 - t1) -
+            (double)(i2 - i1)) /
+           (double)(t2 - t1);
+}
+
+static int read_memory(unsigned long long *total_kb,
+                       unsigned long long *available_kb)
+{
+    FILE *f;
+
+    char key[64];
+    char unit[32];
+
+    unsigned long long value;
+
+    *total_kb = 0;
+    *available_kb = 0;
+
+    f = fopen("/proc/meminfo", "r");
+
+    if (f == NULL)
+        return -1;
+
+    while (fscanf(f,
+                  "%63s %llu %31s",
+                  key,
+                  &value,
+                  unit) == 3)
+    {
+        if (strcmp(key, "MemTotal:") == 0)
+            *total_kb = value;
+
+        if (strcmp(key, "MemAvailable:") == 0)
+            *available_kb = value;
+    }
+
+    fclose(f);
+
+    if (*total_kb > 0 && *available_kb > 0)
+        return 0;
+
+    return -1;
+}
+
+static double load_average(void)
+{
+    FILE *f;
+
+    double a = 0.0;
+    double b = 0.0;
+    double c = 0.0;
+
+    int rc;
+
+    f = fopen("/proc/loadavg", "r");
+
+    if (f == NULL)
+        return -1.0;
+
+    rc = fscanf(f,
+                "%lf %lf %lf",
+                &a,
+                &b,
+                &c);
+
+    fclose(f);
+
+    if (rc != 3)
+        return -1.0;
+
+    return a;
+}
+
+static const char *scheduler_name(int policy)
+{
+    switch (policy)
+    {
+        case SCHED_OTHER:
+            return "SCHED_OTHER";
+
+        case SCHED_FIFO:
+            return "SCHED_FIFO";
+
+        case SCHED_RR:
+            return "SCHED_RR";
+
+#ifdef SCHED_BATCH
+        case SCHED_BATCH:
+            return "SCHED_BATCH";
+#endif
+
+#ifdef SCHED_IDLE
+        case SCHED_IDLE:
+            return "SCHED_IDLE";
+#endif
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void show_system_info(void)
+{
+    struct utsname u;
+
+    char hostname[256];
+
+    FILE *f;
+
+    double uptime = 0.0;
+
+    unsigned long long total_kb;
+    unsigned long long avail_kb;
+
+    struct statvfs vfs;
+
+    int policy;
+
+    struct sched_param sp;
+
+    clear_screen();
+
+    printf("===============================================================\n");
+    printf("        LINUX SYSTEM INFORMATION & RESOURCE MONITOR\n");
+    printf("                         FINAL VERSION\n");
+    printf("===============================================================\n\n");
+
+    /*
+     * CO-1:
+     * Linux provides system services through system calls.
+     * User-space programs communicate with kernel services.
+     */
+
+    printf("[ SYSTEM / OS SERVICE LAYER ]\n");
+
+    if (uname(&u) == 0)
+    {
+        if (gethostname(hostname, sizeof(hostname)) != 0)
+        {
+            snprintf(hostname,
+                     sizeof(hostname),
+                     "unknown");
+        }
+
+        hostname[sizeof(hostname) - 1] = '\0';
+
+        printf("OS                 : %s\n",
+               u.sysname);
+
+        printf("Kernel             : %s\n",
+               u.release);
+
+        printf("Architecture       : %s\n",
+               u.machine);
+
+        printf("Hostname           : %s\n",
+               hostname);
+    }
+
+    f = fopen("/proc/uptime", "r");
+
+    if (f != NULL)
+    {
+        if (fscanf(f, "%lf", &uptime) == 1)
+        {
+            printf("Uptime             : %.2f hours\n",
+                   uptime / 3600.0);
+        }
+
+        fclose(f);
+    }
+
+    printf("Current PID        : %ld\n",
+           (long)getpid());
+
+    printf("Parent PID         : %ld\n",
+           (long)getppid());
+
+    printf("Process Group      : %ld\n",
+           (long)getpgrp());
+
+    printf("Session ID         : %ld\n",
+           (long)getsid(0));
+
+    policy = sched_getscheduler(0);
+
+    if (policy >= 0 &&
+        sched_getparam(0, &sp) == 0)
+    {
+        printf("Scheduler           : %s\n",
+               scheduler_name(policy));
+
+        printf("Scheduling priority : %d\n",
+               sp.sched_priority);
+    }
+
+    printf("\n[ RESOURCE UTILIZATION ]\n");
+
+    {
+        double cpu = cpu_usage_once(1);
+
+        if (cpu >= 0)
+        {
+            printf("CPU usage           : %.2f %%\n",
+                   cpu);
+        }
+        else
+        {
+            printf("CPU usage           : unavailable\n");
+        }
+    }
+
+    if (read_memory(&total_kb,
+                    &avail_kb) == 0)
+    {
+        double used =
+            100.0 *
+            (double)(total_kb - avail_kb) /
+            (double)total_kb;
+
+        printf("Memory usage        : %.2f %%\n",
+               used);
+
+        printf("Memory used         : %.2f MB\n",
+               (total_kb - avail_kb) / 1024.0);
+
+        printf("Total memory        : %.2f MB\n",
+               total_kb / 1024.0);
+    }
+
+    printf("Load average (1m)   : %.2f\n",
+           load_average());
+
+    if (statvfs("/", &vfs) == 0)
+    {
+        unsigned long long total =
+            (unsigned long long)vfs.f_blocks *
+            vfs.f_frsize;
+
+        unsigned long long freeb =
+            (unsigned long long)vfs.f_bavail *
+            vfs.f_frsize;
+
+        if (total > 0)
+        {
+            printf("Root disk usage     : %.2f %%\n",
+                   100.0 *
+                   (double)(total - freeb) /
+                   (double)total);
+        }
+    }
+
+    printf("\n[ ACTIVE PROCESSES ]\n");
+
+    printf("PID      PPID     STATE    COMMAND\n");
+    printf("-----------------------------------------------\n");
+
+    {
+        FILE *ps;
+
+        char line[256];
+
+        ps = popen(
+            "ps -eo pid,ppid,state,comm --sort=-%cpu | head -n 8",
+            "r");
+
+        if (ps != NULL)
+        {
+            while (fgets(line,
+                         sizeof(line),
+                         ps) != NULL)
+            {
+                fputs(line, stdout);
+            }
+
+            (void)pclose(ps);
+        }
+    }
+
+    printf("\n---------------------------------------------------------------\n");
+
+    printf("Keys: [h] help  [p] processes  [i] IPC  [m] memory\n");
+    printf("     [f] files  [t] threads  [r] refresh  [q] quit\n");
+
+    printf("Auto monitor refresh interval: %d seconds\n",
+           REFRESH_SECONDS);
+}
+
+/* ============================================================
+   CO-2: PROCESSES AND PROCESS CONTROL
+   ============================================================ */
+
+static void co2_process_demo(void)
+{
+    int p[2];
+
+    pid_t child;
+
+    int status;
+
+    char buf[128] = {0};
+
+    const char msg[] =
+        "Child -> Parent: process IPC message";
+
+    clear_screen();
+
+    printf("================ CO-2: PROCESS CONTROL ================\n\n");
+
+    printf("Parent PID: %ld\n",
+           (long)getpid());
+
+    printf("Creating child with fork()...\n");
+
+    if (pipe(p) != 0)
+    {
+        perror("pipe");
+        return;
+    }
+
+    child = fork();
+
+    if (child < 0)
+    {
+        perror("fork");
+
+        close(p[0]);
+        close(p[1]);
+
+        return;
+    }
+
+    if (child == 0)
+    {
+        ssize_t n;
+
+        close(p[0]);
+
+        n = write(p[1],
+                  msg,
+                  sizeof(msg) - 1);
+
+        if (n < 0)
+            perror("child write");
+
+        close(p[1]);
+
+        /*
+         * exec() replaces the current process image.
+         */
+
+        execlp("uname",
+               "uname",
+               "-srm",
+               (char *)NULL);
+
+        perror("execlp");
+
+        _exit(127);
+    }
+
+    close(p[1]);
+
+    {
+        ssize_t n =
+            read(p[0],
+                 buf,
+                 sizeof(buf) - 1);
+
+        if (n < 0)
+        {
+            perror("parent read");
+        }
+        else if (n > 0)
+        {
+            buf[n] = '\0';
+
+            printf("Message received before exec: %s\n",
+                   buf);
+        }
+    }
+
+    close(p[0]);
+
+    printf("Parent waiting with waitpid(%ld)...\n",
+           (long)child);
+
+    if (waitpid(child,
+                &status,
+                0) < 0)
+    {
+        perror("waitpid");
+        return;
+    }
+
+    if (WIFEXITED(status))
+    {
+        printf("Child terminated normally, "
+               "exit status=%d\n",
+               WEXITSTATUS(status));
+    }
+    else if (WIFSIGNALED(status))
+    {
+        printf("Child terminated by signal %d\n",
+               WTERMSIG(status));
+    }
+
+    printf("\n");
+    printf("Demonstrated:\n");
+    printf("fork()    -> process creation\n");
+    printf("exec()    -> process execution\n");
+    printf("waitpid() -> process synchronization\n");
+    printf("exit      -> process termination\n");
+
+    printf("\nScheduling policy: %s\n",
+           scheduler_name(
+               sched_getscheduler(0)));
+
+    printf("Priority (nice): %d\n",
+           getpriority(PRIO_PROCESS, 0));
+}
+
+/* ============================================================
+   CO-3: INTER-PROCESS COMMUNICATION
+   ============================================================ */
+
+static void anonymous_pipe_demo(void)
+{
+    int p[2];
+
+    pid_t child;
+
+    const char msg[] =
+        "Anonymous pipe: child sent this message.";
+
+    char buf[128] = {0};
+
+    if (pipe(p) != 0)
+    {
+        perror("pipe");
+        return;
+    }
+
+    child = fork();
+
+    if (child < 0)
+    {
+        perror("fork");
+
+        close(p[0]);
+        close(p[1]);
+
+        return;
+    }
+
+    if (child == 0)
+    {
+        ssize_t n;
+
+        close(p[0]);
+
+        n = write(p[1],
+                  msg,
+                  sizeof(msg) - 1);
+
+        if (n < 0)
+            perror("pipe write");
+
+        close(p[1]);
+
+        _exit(0);
+    }
+
+    close(p[1]);
+
+    {
+        ssize_t n =
+            read(p[0],
+                 buf,
+                 sizeof(buf) - 1);
+
+        if (n < 0)
+        {
+            perror("pipe read");
+        }
+        else if (n > 0)
+        {
+            buf[n] = '\0';
+
+            printf("Anonymous pipe received: %s\n",
+                   buf);
+        }
+    }
+
+    close(p[0]);
+
+    (void)waitpid(child,
+                  NULL,
+                  0);
+}
+
+static void named_fifo_demo(void)
+{
+    pid_t child;
+
+    int fd;
+
+    char buf[128] = {0};
+
+    const char msg[] =
+        "Named FIFO: child sent this message.";
+
+    if (mkfifo(FIFO_PATH,
+               0600) != 0 &&
+        errno != EEXIST)
+    {
+        perror("mkfifo");
+        return;
+    }
+
+    child = fork();
+
+    if (child < 0)
+    {
+        perror("fork");
+
+        unlink(FIFO_PATH);
+
+        return;
+    }
+
+    if (child == 0)
+    {
+        ssize_t n;
+
+        fd = open(FIFO_PATH,
+                  O_WRONLY);
+
+        if (fd < 0)
+        {
+            perror("FIFO child open");
+            _exit(1);
+        }
+
+        n = write(fd,
+                  msg,
+                  sizeof(msg) - 1);
+
+        if (n < 0)
+            perror("FIFO write");
+
+        close(fd);
+
+        _exit(0);
+    }
+
+    fd = open(FIFO_PATH,
+              O_RDONLY);
+
+    if (fd < 0)
+    {
+        perror("FIFO parent open");
+    }
+    else
+    {
+        ssize_t n =
+            read(fd,
+                 buf,
+                 sizeof(buf) - 1);
+
+        if (n < 0)
+        {
+            perror("FIFO read");
+        }
+        else if (n > 0)
+        {
+            buf[n] = '\0';
+
+            printf("Named FIFO received: %s\n",
+                   buf);
+        }
+
+        close(fd);
+    }
+
+    (void)waitpid(child,
+                  NULL,
+                  0);
+
+    unlink(FIFO_PATH);
+}
+
+static void signal_demo(void)
+{
+    struct sigaction sa;
+
+    memset(&sa,
+           0,
+           sizeof(sa));
+
+    sa.sa_handler = sigusr1_handler;
+
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGUSR1,
+                  &sa,
+                  NULL) != 0)
+    {
+        perror("sigaction");
+        return;
+    }
+
+    g_signal_count = 0;
+
+    printf("Current PID: %ld\n",
+           (long)getpid());
+
+    if (kill(getpid(),
+             SIGUSR1) != 0)
+    {
+        perror("kill");
+    }
+
+    printf("SIGUSR1 handler count: %d\n",
+           (int)g_signal_count);
+}
+
+static void co3_ipc_demo(void)
+{
+    clear_screen();
+
+    printf("==================== CO-3: IPC ====================\n\n");
+
+    printf("1. Anonymous pipe\n");
+
+    anonymous_pipe_demo();
+
+    printf("\n2. Named pipe (FIFO)\n");
+
+    named_fifo_demo();
+
+    printf("\n3. Signal / asynchronous notification\n");
+
+    signal_demo();
+
+    printf("\n4. Process group / session information\n");
+
+    printf("PID     : %ld\n",
+           (long)getpid());
+
+    printf("PGID    : %ld\n",
+           (long)getpgrp());
+
+    printf("SID     : %ld\n",
+           (long)getsid(0));
+
+    printf("\nIPC demonstration completed safely.\n");
+}
+
+/* ============================================================
+   CO-4: MEMORY MANAGEMENT
+   ============================================================ */
+
+static void co4_memory_demo(void)
+{
+    unsigned long long total;
+    unsigned long long avail;
+
+    FILE *maps;
+
+    char line[256];
+
+    size_t page_size;
+
+    void *region;
+
+    char *heap_data;
+
+    size_t region_size;
+
+    clear_screen();
+
+    printf("================= CO-4: MEMORY =================\n\n");
+
+    page_size =
+        (size_t)sysconf(_SC_PAGESIZE);
+
+    printf("Page size              : %zu bytes\n",
+           page_size);
+
+    if (read_memory(&total,
+                    &avail) == 0)
+    {
+        printf("Physical memory        : %.2f MB\n",
+               total / 1024.0);
+
+        printf("Available memory       : %.2f MB\n",
+               avail / 1024.0);
+    }
+
+    printf("\nProcess virtual memory areas ");
+    printf("(/proc/self/maps):\n");
+
+    maps = fopen("/proc/self/maps",
+                 "r");
+
+    if (maps != NULL)
+    {
+        int count = 0;
+
+        while (count < 12 &&
+               fgets(line,
+                     sizeof(line),
+                     maps) != NULL)
+        {
+            fputs(line,
+                  stdout);
+
+            count++;
+        }
+
+        fclose(maps);
+    }
+    else
+    {
+        perror("/proc/self/maps");
+    }
+
+    printf("\nDynamic allocation: malloc()\n");
+
+    heap_data = malloc(128);
+
+    if (heap_data != NULL)
+    {
+        strcpy(heap_data,
+               "Dynamic memory allocated in user space.");
+
+        printf("Heap data: %s\n",
+               heap_data);
+
+        free(heap_data);
+    }
+
+    printf("\nMemory mapping: mmap()\n");
+
+    region_size =
+        page_size * 2;
+
+    region =
+        mmap(NULL,
+             region_size,
+             PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS,
+             -1,
+             0);
+
+    if (region == MAP_FAILED)
+    {
+        perror("mmap");
+    }
+    else
+    {
+        memset(region,
+               0,
+               region_size);
+
+        printf("Mapped %zu bytes at virtual address %p\n",
+               region_size,
+               region);
+
+        if (munmap(region,
+                   region_size) != 0)
+        {
+            perror("munmap");
+        }
+    }
+
+    printf("\nMemory concepts demonstrated:\n");
+
+    printf("- Virtual address space via /proc/self/maps\n");
+    printf("- Dynamic allocation via malloc/free\n");
+    printf("- Memory mapping via mmap/munmap\n");
+    printf("- Linux demand paging is handled by the kernel\n");
+    printf("- fork() uses Linux copy-on-write semantics\n");
+}
+
+/* ============================================================
+   CO-5: FILE SYSTEMS AND FILE I/O
+   ============================================================ */
+
+static void co5_file_demo(void)
+{
+    int fd;
+
+    const char data[] =
+        "Linux systems programming file I/O demonstration.\n";
+
+    char buf[256] = {0};
+
+    struct stat st;
+
+    struct statvfs vfs;
+
+    struct statfs sfs;
+
+    ssize_t n;
+
+    clear_screen();
+
+    printf("================ CO-5: FILE SYSTEMS =================\n\n");
+
+    fd = open(TEST_FILE,
+              O_CREAT | O_TRUNC | O_RDWR,
+              0600);
+
+    if (fd < 0)
+    {
+        perror("open");
+        return;
+    }
+
+    n = write(fd,
+              data,
+              sizeof(data) - 1);
+
+    if (n < 0)
+    {
+        perror("write");
+    }
+    else
+    {
+        printf("write() wrote %zd bytes\n",
+               n);
+    }
+
+    if (lseek(fd,
+              0,
+              SEEK_SET) == (off_t)-1)
+    {
+        perror("lseek");
+    }
+
+    n = read(fd,
+             buf,
+             sizeof(buf) - 1);
+
+    if (n < 0)
+    {
+        perror("read");
+    }
+    else
+    {
+        buf[n] = '\0';
+
+        printf("read() returned %zd bytes: %s",
+               n,
+               buf);
+    }
+
+    if (fstat(fd,
+              &st) == 0)
+    {
+        printf("File descriptor      : %d\n",
+               fd);
+
+        printf("Inode                : %lu\n",
+               (unsigned long)st.st_ino);
+
+        printf("File size            : %lld bytes\n",
+               (long long)st.st_size);
+
+        printf("Permissions          : %o\n",
+               (unsigned)(st.st_mode & 0777));
+
+        printf("Device major:minor   : %u:%u\n",
+               major(st.st_dev),
+               minor(st.st_dev));
+    }
+
+    close(fd);
+
+    if (statvfs("/",
+                &vfs) == 0)
+    {
+        unsigned long long total =
+            (unsigned long long)vfs.f_blocks *
+            vfs.f_frsize;
+
+        unsigned long long freeb =
+            (unsigned long long)vfs.f_bavail *
+            vfs.f_frsize;
+
+        printf("\nRoot filesystem capacity: %.2f GB\n",
+               total /
+               (1024.0 * 1024.0 * 1024.0));
+
+        printf("Root filesystem free    : %.2f GB\n",
+               freeb /
+               (1024.0 * 1024.0 * 1024.0));
+    }
+
+    if (statfs("/",
+               &sfs) == 0)
+    {
+        printf("Filesystem magic         : 0x%lx\n",
+               (unsigned long)sfs.f_type);
+
+        if ((unsigned long)sfs.f_type ==
+            EXT4_SUPER_MAGIC)
+        {
+            printf("Filesystem type          : ext4\n");
+        }
+        else
+        {
+            printf("Filesystem type          : not ext4\n");
+        }
+    }
+
+    {
+        int dirfd =
+            open("/tmp",
+                 O_RDONLY | O_DIRECTORY);
+
+        if (dirfd >= 0)
+        {
+            printf("Directory abstraction    : "
+                   "/tmp opened as fd %d\n",
+                   dirfd);
+
+            close(dirfd);
+        }
+    }
+
+    if (unlink(TEST_FILE) != 0)
+        perror("unlink");
+
+    printf("\nDemonstrated:\n");
+
+    printf("- Unix file descriptors\n");
+    printf("- open/read/write/lseek\n");
+    printf("- inode information\n");
+    printf("- directory abstraction\n");
+    printf("- filesystem statistics\n");
+    printf("- unbuffered file I/O\n");
+    printf("- VFS provides a common interface to filesystems\n");
+}
+
+/* ============================================================
+   CO-6: CONCURRENCY AND SYNCHRONIZATION
+   ============================================================ */
+
+static pthread_mutex_t counter_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_cond_t counter_cond =
+    PTHREAD_COND_INITIALIZER;
+
+static sem_t slots;
+
+static long long shared_counter = 0;
+
+static int workers_finished = 0;
+
+static void *counter_worker(void *arg)
+{
+    long id = (long)arg;
+
+    int i;
+
+    for (i = 0;
+         i < ITERATIONS;
+         ++i)
+    {
+        if (pthread_mutex_lock(&counter_mutex) != 0)
+            break;
+
+        shared_counter++;
+
+        pthread_mutex_unlock(&counter_mutex);
+    }
+
+    if (sem_wait(&slots) == 0)
+    {
+        printf("Thread %ld acquired counting semaphore\n",
+               id);
+
+        if (pthread_mutex_lock(&counter_mutex) == 0)
+        {
+            workers_finished++;
+
+            pthread_cond_signal(&counter_cond);
+
+            pthread_mutex_unlock(&counter_mutex);
+        }
+
+        sem_post(&slots);
+    }
+
+    return NULL;
+}
+
+static void co6_thread_demo(void)
+{
+    pthread_t threads[THREAD_COUNT];
+
+    int i;
+
+    int created = 0;
+
+    long long expected;
+
+    clear_screen();
+
+    printf("================ CO-6: CONCURRENCY =================\n\n");
+
+    printf("Creating %d POSIX threads.\n",
+           THREAD_COUNT);
+
+    printf("Each thread increments a shared counter %d times.\n",
+           ITERATIONS);
+
+    shared_counter = 0;
+
+    workers_finished = 0;
+
+    if (sem_init(&slots,
+                 0,
+                 2) != 0)
+    {
+        perror("sem_init");
+        return;
+    }
+
+    for (i = 0;
+         i < THREAD_COUNT;
+         ++i)
+    {
+        if (pthread_create(
+                &threads[i],
+                NULL,
+                counter_worker,
+                (void *)(long)(i + 1)) != 0)
+        {
+            perror("pthread_create");
+            break;
+        }
+
+        created++;
+    }
+
+    expected =
+        (long long)created *
+        ITERATIONS;
+
+    if (pthread_mutex_lock(&counter_mutex) == 0)
+    {
+        while (workers_finished < created)
+        {
+            pthread_cond_wait(
+                &counter_cond,
+                &counter_mutex);
+        }
+
+        pthread_mutex_unlock(&counter_mutex);
+    }
+
+    for (i = 0;
+         i < created;
+         ++i)
+    {
+        pthread_join(
+            threads[i],
+            NULL);
+    }
+
+    printf("\nThreads completed     : %d\n",
+           created);
+
+    printf("Expected counter      : %lld\n",
+           expected);
+
+    printf("Actual counter        : %lld\n",
+           shared_counter);
+
+    printf("Synchronization       : "
+           "mutex + condition variable + semaphore\n");
+
+    printf("Race condition avoided: "
+           "shared counter protected by mutex\n");
+
+    printf("Deadlock prevention   : "
+           "consistent lock ownership and no lock cycle\n");
+
+    sem_destroy(&slots);
+}
+
+/* ============================================================
+   HELP
+   ============================================================ */
+
+static void show_help(void)
+{
+    clear_screen();
+
+    printf("======================= HELP =======================\n\n");
+
+    printf("This is one unified terminal Linux "
+           "systems-programming tool.\n\n");
+
+    printf("h  Help / project overview\n");
+
+    printf("p  Process creation, execution, "
+           "synchronization and scheduling\n");
+
+    printf("i  IPC: anonymous pipe, FIFO, signals, "
+           "process groups\n");
+
+    printf("m  Memory: virtual address space, "
+           "malloc, mmap, paging concepts\n");
+
+    printf("f  Files: descriptors, read/write, "
+           "inode, filesystem information\n");
+
+    printf("t  Threads: mutex, condition variable, "
+           "semaphore, race/deadlock concepts\n");
+
+    printf("r  Refresh main system monitor\n");
+
+    printf("q  Quit\n\n");
+
+    printf("Course outcomes implemented in source comments:\n");
+
+    printf("CO-1 OS service layer\n");
+    printf("CO-2 processes\n");
+    printf("CO-3 IPC\n");
+    printf("CO-4 memory\n");
+    printf("CO-5 file systems/I/O\n");
+    printf("CO-6 synchronization\n");
+}
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+int main(void)
+{
+    struct sigaction sa;
+
+    char command[32];
+
+    memset(&sa,
+           0,
+           sizeof(sa));
+
+    sa.sa_handler = sigint_handler;
+
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGINT,
+                  &sa,
+                  NULL) != 0)
+    {
+        perror("sigaction");
+        return EXIT_FAILURE;
+    }
+
+    while (g_running)
+    {
+        show_system_info();
+
+        printf("\nCommand: ");
+
+        fflush(stdout);
+
+        if (fgets(command,
+                  sizeof(command),
+                  stdin) == NULL)
+        {
+            break;
+        }
+
+        switch (command[0])
+        {
+            case 'h':
+            case 'H':
+                show_help();
+                wait_for_enter();
+                break;
+
+            case 'p':
+            case 'P':
+                co2_process_demo();
+                wait_for_enter();
+                break;
+
+            case 'i':
+            case 'I':
+                co3_ipc_demo();
+                wait_for_enter();
+                break;
+
+            case 'm':
+            case 'M':
+                co4_memory_demo();
+                wait_for_enter();
+                break;
+
+            case 'f':
+            case 'F':
+                co5_file_demo();
+                wait_for_enter();
+                break;
+
+            case 't':
+            case 'T':
+                co6_thread_demo();
+                wait_for_enter();
+                break;
+
+            case 'r':
+            case 'R':
+                break;
+
+            case 'q':
+            case 'Q':
+                g_running = 0;
+                break;
+
+            default:
+                printf("Unknown command. Press h for help.\n");
+                sleep(1);
+                break;
+        }
+    }
+
+    printf("\nSystem monitor stopped safely.\n");
+
+    return EXIT_SUCCESS;
+}
